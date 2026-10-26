@@ -174,3 +174,7 @@ text, so credentials on a command line do not land in the log.
   `timeout_s` is left at the default 120 s.
 - One remote at a time (one `SSH2MCP_SSH_HOST`). Multiple hosts need multiple instances
   on different ports.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
