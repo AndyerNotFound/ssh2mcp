@@ -138,6 +138,13 @@ it automatically:
 git config core.hooksPath hooks
 ```
 
+The bare repository on the build host is the source of truth; GitHub is a mirror.
+
+```bash
+git push origin main --tags   # bare repository on the build host
+git push github main --tags   # mirror
+```
+
 ## Command line
 
 ```
