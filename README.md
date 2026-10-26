@@ -21,8 +21,8 @@ server, rather than binding a second workspace.
   refuses to start without one.
 - `localhostHostValidation()` rejects DNS-rebinding hosts on every route.
 - Loopback is not access control: any app on the device with the INTERNET permission can
-  reach 127.0.0.1, and this process runs commands as root on a host that faces the network.
-  Keep the token at mode 600 and treat the server as privileged.
+  reach 127.0.0.1, while the commands themselves run with the privileges of the ssh user on
+  the remote host. Keep the token at mode 600 and treat both ends as privileged.
 
 Generate the token yourself, so that it never passes through a model:
 
