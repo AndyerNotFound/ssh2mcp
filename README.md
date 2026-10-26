@@ -61,14 +61,22 @@ sandbox: a deliberately crafted equivalent command will get through.
   payload), starts it with `setsid`, and returns a job id plus pid.
 - `log` returns the chunk after `since` (a byte offset) plus `next_since` and the state
   (`running` / `done:<code>` / `gone`), so a client polls without re-reading the log.
-- A `run` that hits the timeout only kills the local `ssh`; the remote command may keep
-  running. Use `bg` for anything long.
+- `run` is bounded on both ends: the command goes to the host as
+  `timeout -k 5 <N> sh -c '<cmd>'`, so the deadline stops the remote process group too,
+  and the call returns at the deadline instead of at the end of the remote command.
+  `bg` is not bounded — use it for anything that must outlive a call.
+- `run` opts out of connection multiplexing (`ControlPath=none`). Under `ControlMaster`
+  the mux master keeps the stdio pipe open after the client is killed, so the call used
+  to stay blocked until the remote command finished; the opt-out costs ~0.6 s per call.
 
 ### `s_xfer`
 
 `{op: "pull"|"push"|"status", local, remote, verify?}`
 
-`pull` = remote to device, `push` = device to remote. Both resume from the first missing
+`pull` = remote to device, `push` = device to remote. The exit code is read from the ssh
+child itself rather than from the closing of its stdio pipe: on small files the child can
+exit before the pipe drains, and waiting for `close` afterwards hung the call. Both resume
+from the first missing
 byte (`tail -c +N` on the sending side), write to `<dest>.part`, and only rename after
 `sha256` matches on both ends. A mismatch renames the partial to `.corrupt` and fails; it
 never reports success for a truncated file. Bytes never enter the model context.
@@ -162,5 +170,7 @@ text, so credentials on a command line do not land in the log.
   subcommand allowlist.
 - Stateless Streamable HTTP cannot push token-by-token text; progress is delivered by
   `bg` + `log` polling instead.
+- The `run` timeout is a hard cap on the host as well: a long build is killed mid-way if
+  `timeout_s` is left at the default 120 s.
 - One remote at a time (one `SSH2MCP_SSH_HOST`). Multiple hosts need multiple instances
   on different ports.
