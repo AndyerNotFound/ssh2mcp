@@ -1,0 +1,454 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""s2m — CLI front-end for the ssh2mcp server.
+
+Everything goes through the MCP endpoint, so the permission level, the path jail and the
+risk table apply here exactly as they do for the agent. Aliases are symlinks to this file
+and pick a default subcommand from their own name.
+"""
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+DIR = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser("~")
+BASE = os.environ.get("S2M_BASE", "http://127.0.0.1:6222")
+TOKEN_FILE = os.path.join(HOME, ".ssh2mcp-token")
+PERM_FILE = os.path.join(HOME, ".ssh2mcp-perm")
+STATE = os.path.join(HOME, ".ssh2mcp")
+PERMS = ("ro", "rw", "full", "selfcheck")
+ALIASES = {"s2mstl": "st", "s2msh": "sh", "s2mck": "check",
+           "s2mpl": "pull", "s2mps": "push", "s2mbg": "bg", "s2mtk": "token"}
+
+
+def token():
+    try:
+        return open(TOKEN_FILE).read().strip()
+    except OSError:
+        die("no token at " + TOKEN_FILE + " (server cannot run without one)")
+
+
+def die(msg):
+    print("s2m: " + msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def http(path, method="GET", body=None):
+    hdr = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json",
+           "Authorization": "Bearer " + token()}
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, headers=hdr, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            raw = r.read().decode()
+            ctype = r.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        raw, ctype = e.read().decode(), e.headers.get("Content-Type", "")
+    except (urllib.error.URLError, OSError) as e:
+        die("server unreachable at " + BASE + " (" + str(e.reason if hasattr(e, 'reason') else e) + ")\n  start it: " + DIR + "/restart.sh")
+    if "text/event-stream" in ctype:
+        for line in raw.splitlines():
+            if line.startswith("data: "):
+                return json.loads(line[6:])
+        die("unexpected SSE stream")
+    return json.loads(raw)
+
+
+def call(tool, args):
+    j = http("/mcp", "POST", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": tool, "arguments": args}})
+    res = j.get("result", {})
+    txt = (res.get("content") or [{}])[0].get("text", "{}")
+    try:
+        obj = json.loads(txt)
+    except ValueError:
+        obj = {"raw": txt}
+    return res.get("isError", False), obj
+
+
+def flag(rest, name, cast=str):
+    """Pull --name value out of rest, return (value, rest)."""
+    if name in rest:
+        i = rest.index(name)
+        if i + 1 >= len(rest):
+            die(name + " needs a value")
+        return cast(rest[i + 1]), rest[:i] + rest[i + 2:]
+    return None, rest
+
+
+def show(cmd_out):
+    print(cmd_out.rstrip())
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_st(rest):
+    try:
+        s = http("/status")
+    except SystemExit:
+        raise
+    print("%s %s   %s" % (s["server"], s["version"], s["bind"]))
+    print("  ssh      %s" % s["host"])
+    print("  perm     %s  (fallback %s, hot file %s)" % (s["perm"], s["perm_fallback"], os.path.basename(s["perm_file"])))
+    if s["perm"] in ("full", "selfcheck"):
+        print("  !!       perm=%s - risk table and path jail are NOT in force" % s["perm"])
+    print("  jail     %s" % (s["jail"] or "(none)"))
+    print("  rules    %d   tools %s" % (s["risk_rules"], ", ".join(s["tools"])))
+    log = os.path.join(STATE, "ssh2mcp.log")
+    if os.path.exists(log):
+        tail = open(log, errors="replace").read().strip().splitlines()[-2:]
+        for line in tail:
+            print("  log      " + line.strip())
+    audit = os.path.join(STATE, "audit.log")
+    if os.path.exists(audit):
+        last = open(audit, errors="replace").read().strip().splitlines()
+        if last:
+            try:
+                rec = json.loads(last[-1])
+                print("  last     %s %s %s exit=%s %sms" % (rec.get("ts", "")[11:19], rec.get("tool", ""), rec.get("op", ""), rec.get("exit", "-"), rec.get("ms", "-")))
+            except ValueError:
+                pass
+    return 0
+
+
+def cmd_perm(rest):
+    if not rest:
+        s = http("/status")
+        hot = None
+        if os.path.exists(PERM_FILE):
+            hot = open(PERM_FILE).read().strip()
+        print("effective  %s" % s["perm"])
+        print("startup    %s" % s["perm_fallback"])
+        print("hot file   %s%s" % (PERM_FILE, ("  -> " + hot) if hot else "  (absent: startup value wins)"))
+        print("levels     " + ", ".join(PERMS))
+        return 0
+    level = rest[0].lower()
+    if level == "full" and "--force" not in rest:
+        print("refusing: 'full' downgrades the risk table to warnings and disables the path jail", file=sys.stderr)
+        print("  if you mean it: s2m perm full --force    (and put it back with: s2m perm rw)", file=sys.stderr)
+        return 1
+    if level == "off":
+        if os.path.exists(PERM_FILE):
+            os.remove(PERM_FILE)
+        print("hot file removed; back to " + http("/status")["perm_fallback"])
+        return 0
+    if level not in PERMS:
+        die("unknown level " + level + " (expected one of " + ", ".join(PERMS) + ", off)")
+    open(PERM_FILE, "w").write(level + "\n")
+    os.chmod(PERM_FILE, 0o600)
+    eff = http("/status")["perm"]
+    print("perm -> " + eff + " (effective now, no restart)")
+    if eff != level:
+        print("warning: the server still reports " + eff + "; check " + PERM_FILE, file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_sh(rest):
+    cwd, rest = flag(rest, "--cwd")
+    timeout, rest = flag(rest, "--timeout", float)
+    if not rest:
+        die("usage: s2m sh [--cwd DIR] [--timeout SEC] <command ...>")
+    args = {"op": "run", "command": " ".join(rest)}
+    if cwd:
+        args["cwd"] = cwd
+    if timeout:
+        args["timeout_s"] = timeout
+    err, r = call("s_shell", args)
+    if err:
+        die(r.get("error", json.dumps(r)))
+    if r.get("stdout"):
+        sys.stdout.write(r["stdout"])
+        if not r["stdout"].endswith("\n"):
+            sys.stdout.write("\n")
+    if r.get("stderr"):
+        sys.stderr.write(r["stderr"])
+        if not r["stderr"].endswith("\n"):
+            sys.stderr.write("\n")
+    if r.get("exit") != 0:
+        print("[exit %s, %sms]" % (r.get("exit"), r.get("ms")), file=sys.stderr)
+    return 0 if r.get("exit") == 0 else (r.get("exit") or 1)
+
+
+def cmd_bg(rest):
+    cwd, rest = flag(rest, "--cwd")
+    if not rest:
+        die("usage: s2m bg [--cwd DIR] <command ...>")
+    args = {"op": "bg", "command": " ".join(rest)}
+    if cwd:
+        args["cwd"] = cwd
+    err, r = call("s_shell", args)
+    if err:
+        die(r.get("error", json.dumps(r)))
+    print("job %s  pid %s  ->  s2m log %s" % (r["job"], r.get("pid"), r["job"]))
+    return 0
+
+
+def cmd_log(rest):
+    if not rest:
+        die("usage: s2m log <job> [since-byte]")
+    since = int(rest[1]) if len(rest) > 1 else 0
+    err, r = call("s_shell", {"op": "log", "job": rest[0], "since": since})
+    if err:
+        die(r.get("error", json.dumps(r)))
+    sys.stdout.write(r.get("chunk", ""))
+    print("[%s, next_since=%s]" % (r.get("state"), r.get("next_since")), file=sys.stderr)
+    return 0
+
+
+def cmd_kill(rest):
+    if not rest:
+        die("usage: s2m kill <job>")
+    err, r = call("s_shell", {"op": "kill", "job": rest[0]})
+    if err:
+        die(r.get("error", json.dumps(r)))
+    print(r.get("result"))
+    return 0
+
+
+def cmd_jobs(rest):
+    script = ('for f in /tmp/s2m-*.pid; do [ -e "$f" ] || continue; id=${f#/tmp/s2m-}; id=${id%.pid}; '
+              'if [ -f /tmp/s2m-$id.exit ]; then st=done:$(cat /tmp/s2m-$id.exit); '
+              'elif [ -f /tmp/s2m-$id.pid ] && kill -0 $(cat /tmp/s2m-$id.pid) 2>/dev/null; then st=running; else st=gone; fi; '
+              'printf "%s %-10s %s\\n" "$id" "$st" "$(wc -c < /tmp/s2m-$id.log 2>/dev/null || echo 0)"; done')
+    err, r = call("s_shell", {"op": "run", "command": script})
+    if err:
+        die(r.get("error", json.dumps(r)))
+    out = r.get("stdout", "").strip()
+    print("%-13s %-10s %s" % ("JOB", "STATE", "LOG-BYTES"))
+    print(out if out else "(no jobs)")
+    return 0
+
+
+def cmd_pull(rest):
+    if not rest:
+        die("usage: s2m pull <remote-path> [local-path]")
+    remote = rest[0]
+    local = rest[1] if len(rest) > 1 else os.path.join(HOME, "incoming", os.path.basename(remote.rstrip("/")))
+    err, r = call("s_xfer", {"op": "pull", "local": local, "remote": remote})
+    if err:
+        die(r.get("error", json.dumps(r)))
+    print("%s -> %s  %s bytes  %s  resumed_from=%s  %sms" % (
+        remote, local, r.get("bytes"), (r.get("sha256") or "")[:16], r.get("resumed_from"), r.get("ms")))
+    return 0
+
+
+def cmd_push(rest):
+    if len(rest) < 2:
+        die("usage: s2m push <local-path> <remote-path>")
+    err, r = call("s_xfer", {"op": "push", "local": rest[0], "remote": rest[1]})
+    if err:
+        die(r.get("error", json.dumps(r)))
+    print("%s -> %s  %s bytes  %s  resumed_from=%s  %sms" % (
+        rest[0], rest[1], r.get("bytes"), (r.get("sha256") or "")[:16], r.get("resumed_from"), r.get("ms")))
+    if r.get("warning"):
+        print("note: " + r["warning"], file=sys.stderr)
+    return 0
+
+
+def cmd_cmp(rest):
+    lroot, rest = flag(rest, "--local-root")
+    rroot, rest = flag(rest, "--remote-root")
+    if not rest:
+        die("usage: s2m cmp <path> [--local-root DIR] [--remote-root DIR]\n       s2m cmp <local-path> <remote-path>")
+    args = {"op": "compare"}
+    if len(rest) >= 2:
+        args["local_path"], args["remote_path"] = rest[0], rest[1]
+    else:
+        args["path"] = rest[0]
+        if lroot:
+            args["local_root"] = lroot
+        if rroot:
+            args["remote_root"] = rroot
+    err, r = call("s_file", args)
+    if err:
+        die(r.get("error", json.dumps(r)))
+    print("%-16s %s" % ("verdict", r.get("verdict")))
+    for side in ("local", "remote"):
+        d = r.get(side) or {}
+        if d.get("exists"):
+            print("%-16s exists  %s bytes  mtime %s  %s" % (side, d.get("size"), d.get("mtime"), (d.get("sha256") or "")[:16]))
+        else:
+            print("%-16s missing" % side)
+    fd = r.get("first_diff")
+    if fd:
+        print("%-16s line %s\n  local : %s\n  remote: %s" % ("first-diff", fd["line"], fd.get("local"), fd.get("remote")))
+    return 0 if r.get("verdict") == "same" else 2
+
+
+def cmd_token(rest):
+    if rest and rest[0] in ("new", "--new", "rotate"):
+        return rotate_token()
+    if rest:
+        die("usage: s2m token [new]   (values are never accepted on the command line)")
+    try:
+        t = open(TOKEN_FILE).read().strip()
+    except OSError:
+        print("missing  " + TOKEN_FILE)
+        print('  create: python3 -c "import secrets;print(secrets.token_hex(24))" > ' + TOKEN_FILE)
+        return 1
+    st = os.stat(TOKEN_FILE)
+    mode = st.st_mode & 0o777
+    ishex = all(c in "0123456789abcdef" for c in t.lower())
+    masked = (t[:4] + "…" + t[-4:]) if len(t) > 12 else "(too short)"
+    print("file     " + TOKEN_FILE)
+    print("length   %d chars%s" % (len(t), " (hex, %d bit)" % (len(t) * 4) if ishex else ""))
+    print("mode     %o%s" % (mode, "" if mode == 0o600 else "   <- should be 600"))
+    print("value    %s   (masked; full value: cat %s)" % (masked, TOKEN_FILE))
+    print("header   Authorization: Bearer <value>")
+    print("curl     curl -H \"Authorization: Bearer $(cat %s)\" %s/status" % (TOKEN_FILE, BASE))
+    bad = []
+    if mode != 0o600:
+        bad.append("mode is %o, run: chmod 600 %s" % (mode, TOKEN_FILE))
+    if len(t) < 32:
+        bad.append("shorter than 32 chars, rotate: s2m token new")
+    for b in bad:
+        print("warning  " + b)
+    return 0 if not bad else 1
+
+
+def rotate_token():
+    import secrets
+    t = secrets.token_hex(24)
+    tmp = TOKEN_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, (t + "\n").encode())
+    finally:
+        os.close(fd)
+    os.replace(tmp, TOKEN_FILE)
+    print("new token written  %d chars, mode 600" % len(t))
+    try:
+        s = http("/status")
+    except SystemExit:
+        print("server did not accept the new token", file=sys.stderr)
+        return 1
+    print("verified           /status 200 (perm=%s) - the running server already uses it" % s.get("perm"))
+    print("action             update the Authorization header in every MCP client now; the old token is dead")
+    return 0
+
+
+def cmd_audit(rest):
+    n = int(rest[0]) if rest else 10
+    p = os.path.join(STATE, "audit.log")
+    if not os.path.exists(p):
+        print("(no audit log yet)")
+        return 0
+    for line in open(p, errors="replace").read().strip().splitlines()[-n:]:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("tool") == "perm-change":
+            print("%s  perm-change  %s -> %s" % (rec.get("ts", "")[11:19], rec.get("prev"), rec.get("perm")))
+            continue
+        bits = [rec.get("ts", "")[11:19], str(rec.get("tool")), str(rec.get("op")), "perm=" + str(rec.get("perm"))]
+        if rec.get("rules"):
+            bits.append("rules=" + ",".join(rec["rules"]))
+        if rec.get("job"):
+            bits.append("job=" + rec["job"])
+        if rec.get("exit") is not None:
+            bits.append("exit=" + str(rec["exit"]))
+        if rec.get("bytes"):
+            bits.append(str(rec["bytes"]) + "B")
+        print("  ".join(bits))
+    return 0
+
+
+def run_node(args):
+    return subprocess.call(["node", os.path.join(DIR, "index.js")] + args, cwd=DIR)
+
+
+def cmd_check(rest):
+    return run_node(["--self-check"])
+
+
+def cmd_test(rest):
+    rc = run_node(["--self-test"])
+    if rc:
+        return rc
+    rc = subprocess.call([sys.executable, os.path.join(DIR, "smoke-test.py")], cwd=DIR)
+    if rc:
+        return rc
+    if "--full" in rest:
+        return subprocess.call([sys.executable, os.path.join(DIR, "e2e-test.py")], cwd=DIR)
+    print("(add --full for the end-to-end transfer test)")
+    return 0
+
+
+def cmd_start(rest):
+    return subprocess.call([os.path.join(DIR, "restart.sh")] + rest, cwd=DIR)
+
+
+def cmd_stop(rest):
+    pid_file = os.path.join(STATE, "ssh2mcp.pid")
+    try:
+        pid = int(open(pid_file).read().strip())
+    except (OSError, ValueError):
+        print("not running")
+        return 0
+    try:
+        os.kill(pid, 15)
+        print("stopped pid " + str(pid))
+    except ProcessLookupError:
+        print("not running (stale pid file)")
+    return 0
+
+
+def cmd_restart(rest):
+    return cmd_start(rest)
+
+
+USAGE = """s2m — CLI for ssh2mcp (every call goes through the MCP endpoint)
+
+  s2m st | status            server state, perm, last log + audit line   (alias s2mstl)
+  s2m start [--perm LEVEL]   start/restart detached
+  s2m stop                   stop
+  s2m perm [LEVEL|off]       show or hot-switch ro|rw|full|selfcheck
+  s2m sh  [--cwd D] [--timeout S] CMD ...    run remotely              (alias s2msh)
+  s2m bg  [--cwd D] CMD ...  detached job, prints its id                (alias s2mbg)
+  s2m log JOB [since]        job output since a byte offset
+  s2m kill JOB               stop a job
+  s2m jobs                   list detached jobs on the host
+  s2m pull REMOTE [LOCAL]    host -> device (default ~/incoming/)       (alias s2mpl)
+  s2m push LOCAL REMOTE      device -> host                             (alias s2mps)
+  s2m cmp PATH [--local-root D] [--remote-root D]
+  s2m cmp LOCAL REMOTE       compare two explicit paths
+  s2m token [new]            show the bearer token masked / rotate it   (alias s2mtk)
+  s2m audit [N]              tail the audit log
+  s2m check                  remote connectivity + toolchain            (alias s2mck)
+  s2m test [--full]          offline rules + smoke (+ end-to-end)
+
+Env: S2M_BASE (default http://127.0.0.1:6222)
+"""
+
+COMMANDS = {"st": cmd_st, "status": cmd_st, "start": cmd_start, "stop": cmd_stop,
+            "restart": cmd_restart, "perm": cmd_perm, "sh": cmd_sh, "bg": cmd_bg,
+            "log": cmd_log, "kill": cmd_kill, "jobs": cmd_jobs, "pull": cmd_pull,
+            "push": cmd_push, "cmp": cmd_cmp, "audit": cmd_audit, "check": cmd_check, "token": cmd_token,
+            "test": cmd_test}
+
+
+def main():
+    argv = sys.argv[1:]
+    base = os.path.basename(sys.argv[0])
+    if base in ALIASES:
+        argv = [ALIASES[base]] + argv
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        print(USAGE)
+        return 2
+    return fn(rest)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

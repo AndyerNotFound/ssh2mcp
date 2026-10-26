@@ -1,0 +1,14 @@
+{
+  "name": "ssh2mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing a remote SSH host as shell/xfer/file tools (loopback + bearer auth)",
+  "main": "index.js",
+  "type": "commonjs",
+  "license": "MIT",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "express": "^5.2.1",
+    "zod": "^4.4.3"
+  }
+}
