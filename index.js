@@ -60,6 +60,10 @@ const HASH_CAP = 128 * 1024 * 1024;      // files above this are compared by siz
 const DIFF_CAP = 65536;                  // largest file we line-diff
 const SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                   "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=6"];
+// The user's ~/.ssh/config enables ControlMaster/ControlPersist. A multiplexed client can be
+// SIGKILLed while the mux master keeps the stdio pipe open, so a killed call keeps blocking
+// until the remote command ends. opt-out for calls that must be interruptible.
+const NO_MUX_OPTS = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
 
 // ---------------------------------------------------------------- argv
 
@@ -129,11 +133,12 @@ function sshRun(remoteCmd, opts) {
   const o = opts || {};
   const timeoutMs = Math.min(Number(o.timeoutMs || DEFAULT_TIMEOUT_MS), MAX_TIMEOUT_MS);
   const cap = Number(o.maxBytes || 8 * 1024 * 1024);
+  const sshArgs = o.noMux ? [...SSH_OPTS, ...NO_MUX_OPTS] : SSH_OPTS;
   return new Promise((resolve) => {
     const t0 = Date.now();
     let ch;
     try {
-      ch = spawn(SSH_BIN, [...SSH_OPTS, SSH_HOST, remoteCmd], { stdio: ["pipe", "pipe", "pipe"] });
+      ch = spawn(SSH_BIN, [...sshArgs, SSH_HOST, remoteCmd], { stdio: ["pipe", "pipe", "pipe"] });
     } catch (e) {
       resolve({ code: -1, out: "", err: String(e.message), outBytes: 0, errBytes: 0, ms: 0, timedOut: false });
       return;
@@ -142,7 +147,18 @@ function sshRun(remoteCmd, opts) {
     let outTotal = 0, errTotal = 0, timedOut = false;
     ch.stdout.on("data", (b) => { outTotal += b.length; if (outTotal <= cap) outB.push(b); });
     ch.stderr.on("data", (b) => { errTotal += b.length; if (errTotal <= cap) errB.push(b); });
-    const timer = setTimeout(() => { timedOut = true; try { ch.kill("SIGKILL"); } catch (_) {} }, timeoutMs);
+    // Resolve on the timer, not on 'close': a multiplexed ssh can leave the pipe open after
+    // the kill, which used to make timed_out calls block until the remote command finished.
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { ch.kill("SIGKILL"); } catch (_) {}
+      try { ch.stdout.destroy(); ch.stderr.destroy(); ch.stdin.destroy(); } catch (_) {}
+      resolve({
+        code: -1, signal: "SIGKILL",
+        out: Buffer.concat(outB).toString("utf8"), err: Buffer.concat(errB).toString("utf8"),
+        outBytes: outTotal, errBytes: errTotal, ms: Date.now() - t0, timedOut: true
+      });
+    }, timeoutMs);
     ch.on("error", (e) => {
       clearTimeout(timer);
       resolve({ code: -1, out: Buffer.concat(outB).toString("utf8"), err: String(e.message), outBytes: outTotal, errBytes: errTotal, ms: Date.now() - t0, timedOut });
@@ -254,7 +270,13 @@ async function toolShell(args, perm) {
   if (op === "run") {
     const full = userCommand(args);
     const hits = await preflight(cmd, perm);
-    const r = await sshRun(full, { timeoutMs: Number(args.timeout_s || 0) * 1000 || DEFAULT_TIMEOUT_MS });
+    const timeoutMs = Number(args.timeout_s || 0) * 1000 || DEFAULT_TIMEOUT_MS;
+    // Killing the local client does not stop the remote command (no tty, no SIGHUP), so bound
+    // it on the far side too. GNU timeout puts the child in its own process group and signals
+    // the group, which also takes down the children of `sh -c`.
+    const secs = Math.max(1, Math.round(timeoutMs / 1000));
+    const bounded = "timeout -k 5 " + secs + " sh -c " + q(full);
+    const r = await sshRun(bounded, { timeoutMs, noMux: true });
     const out = truncate(r.out, MAX_OUTPUT), err = truncate(r.err, MAX_OUTPUT);
     audit({ tool: "s_shell", op, perm, cmd_hash: sha(cmd).slice(0, 16), rules: hits.map((h) => h.id), exit: r.code, ms: r.ms });
     return {
@@ -335,8 +357,11 @@ async function streamPull(remotePath, part, start) {
   const ch = spawn(SSH_BIN, [...SSH_OPTS, SSH_HOST, "tail -c +" + (start + 1) + " -- " + q(remotePath)]);
   let errbuf = "";
   ch.stderr.on("data", (b) => { if (errbuf.length < 4096) errbuf += b.toString("utf8"); });
+  // Arm the wait before awaiting pipeline: on small files exit/close can land before
+  // pipeline() resolves, and a once() attached afterwards never fires (silent hang).
+  const exited = once(ch, "exit");
   await pipeline(ch.stdout, fs.createWriteStream(part, { flags: start === 0 ? "w" : "a" }));
-  const [code] = await once(ch, "close");
+  const [code] = await exited;
   if (code !== 0) throw new Error("remote tail failed (" + code + "): " + errbuf.trim());
 }
 
@@ -396,8 +421,9 @@ async function xferPush(local, remote, o) {
     const ch = spawn(SSH_BIN, [...SSH_OPTS, SSH_HOST, "cat >> " + q(rpart)]);
     let errbuf = "";
     ch.stderr.on("data", (b) => { if (errbuf.length < 4096) errbuf += b.toString("utf8"); });
+    const exited = once(ch, "exit");   // arm before pipeline, same race as streamPull
     await pipeline(fs.createReadStream(local, { start }), ch.stdin);
-    const [code] = await once(ch, "close");
+    const [code] = await exited;
     if (code !== 0) throw new Error("remote append failed (" + code + "): " + errbuf.trim());
   }
 
