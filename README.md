@@ -7,8 +7,8 @@ server, rather than binding a second workspace.
 
 ## Requirements
 
-- Key-based `ssh` access to the host. `BatchMode=yes` is forced, so a password prompt is a
-  hard failure rather than a hang.
+- Key-based `ssh` access to the host, configured as a Host alias in `~/.ssh/config`.
+  `BatchMode=yes` is forced, so a password prompt is a hard failure rather than a hang.
 - Node.js with the MCP SDK, Express and Zod (`npm install`).
 
 ## Transport and auth
@@ -111,7 +111,7 @@ deliberately crafted equivalent command passes.
 |---|---|---|
 | `MCP_PORT` | 6222 | listen port |
 | `SSH2MCP_BIND` | 127.0.0.1 | bind address |
-| `SSH2MCP_SSH_HOST` | `cloud` | `~/.ssh/config` Host alias |
+| `SSH2MCP_SSH_HOST` | `myhost` | `~/.ssh/config` Host alias |
 | `SSH2MCP_ROOT` | unset | remote path jail (`s_file`, `s_xfer`, `cwd`) |
 | `SSH2MCP_PERM` | `rw` | startup permission level |
 | `SSH2MCP_TOKEN_FILE` | `~/.ssh2mcp-token` | bearer token |
@@ -119,6 +119,24 @@ deliberately crafted equivalent command passes.
 | `SSH2MCP_MAX_OUTPUT` | 20000 | characters of stdout and stderr kept per call |
 | `SSH2MCP_TIMEOUT_MS` | 120000 | default `run` timeout (maximum 3600000) |
 | `SSH2MCP_SSH_BIN` | `ssh` | ssh binary |
+
+## Local configuration
+
+Values that describe a particular machine stay outside the repository. `restart.sh` sources
+`~/.ssh2mcp.env` before starting the server:
+
+```bash
+SSH2MCP_SSH_HOST=myhost     # a Host alias from ~/.ssh/config
+MCP_PORT=6222
+```
+
+Keep that file at mode 600. `check-public.sh` rejects commits that carry public IPv4
+addresses, key material, GitHub tokens or personal mail addresses, and the pre-push hook runs
+it automatically:
+
+```bash
+git config core.hooksPath hooks
+```
 
 ## Command line
 

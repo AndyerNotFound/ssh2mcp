@@ -6,6 +6,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 STATE="$HOME/.ssh2mcp"
 PID="$STATE/ssh2mcp.pid"
 LOG="$STATE/ssh2mcp.log"
+# Personal values live outside the repository: ~/.ssh2mcp.env (mode 600).
+if [ -f "$HOME/.ssh2mcp.env" ]; then set -a; . "$HOME/.ssh2mcp.env"; set +a; fi
 PORT="${MCP_PORT:-6222}"
 mkdir -p "$STATE"
 if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then
